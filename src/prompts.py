@@ -13,7 +13,9 @@ Rules:
 2) Resolve coreference using the PRIOR TURNS section (e.g. "that value", "in 2008", "the difference").
 3) If arithmetic is needed, put the computation in `expression` using numbers from the document or prior answers. Do not compute in prose.
 4) Percentages MUST be returned as decimals (e.g. 14.136% -> 0.14136). If the question asks for a percent, set is_percentage=true.
-5) Return a JSON object matching the schema. If you cannot answer, set answer=null and explain why in reasoning.
+5) Output MUST be a single JSON object with keys: reasoning, expression, answer, is_percentage.
+6) `answer` MUST be a raw number (no currency symbols, commas, units like \"million\", or extra words). If you cannot produce a number, set answer=null.
+7) Always include `reasoning` (1-2 short sentences). If you cannot answer from the document, explain the missing evidence.
 """
 
 

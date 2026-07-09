@@ -10,12 +10,18 @@ from pydantic import BaseModel, Field
 
 
 class SolverResponse(BaseModel):
-    reasoning: str = Field(description="Brief explanation grounded in the document.")
+    # Local models occasionally omit fields; we keep this optional to avoid hard failures
+    # and rely on downstream code to treat missing reasoning as low-confidence output.
+    reasoning: str | None = Field(
+        default=None, description="Brief explanation grounded in the document."
+    )
     expression: str | None = Field(
         default=None,
         description='Optional arithmetic expression, e.g. "206588 - 181001".',
     )
-    answer: float | None = Field(
+    # Accept either a number or a string; local models often emit formatted answers
+    # (e.g. \"$4 million\"). The solver normalizes these to floats when possible.
+    answer: float | str | None = Field(
         default=None,
         description="Fallback numeric answer if no expression is provided.",
     )

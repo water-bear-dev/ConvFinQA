@@ -80,9 +80,14 @@ def chat(
 def eval(
     split: str = typer.Option("dev", help="Dataset split to evaluate"),
     limit: int = typer.Option(50, help="Max number of conversations to evaluate"),
+    output: str | None = typer.Option(
+        None, help="Optional path to write full eval JSON (results + failures + summary)"
+    ),
 ) -> None:
     """Replay scripted conversations and report execution accuracy."""
-    summary = evaluate_split(split=split, limit=limit)
+    # `--output` is useful for saving 5–10 failure examples for REPORT.md without
+    # re-running model calls (especially helpful for local/slow LLMs).
+    summary = evaluate_split(split=split, limit=limit, output_path=output)
 
     rich_print("[bold blue]Evaluation Summary[/bold blue]")
     rich_print(
@@ -106,6 +111,10 @@ def eval(
                 f"- {f['record_id']} (turn {f['turn']}, type2={f['has_type2']}): "
                 f"gold={f['gold_raw']} pred={f['pred']}"
             )
+
+    if output:
+        # `eval_results.json` is gitignored by default to avoid committing large artifacts.
+        rich_print(f"\n[dim]Wrote eval results to: {output}[/dim]")
 
 
 if __name__ == "__main__":

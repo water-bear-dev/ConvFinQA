@@ -7,6 +7,7 @@ the same way the CLI chat loop would (including wrong prior answers).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,7 +38,8 @@ class EvalSummary:
     acc_turn2plus: float
     acc_type1: float
     acc_type2: float
-    failures: list[dict[str, Any]]
+    failures: list[dict[str, Any]]  # small sample of incorrect turns (for report/examples)
+    results: list[dict[str, Any]]  # full per-turn trace (one row per dialogue turn)
 
 
 def evaluate_split(
@@ -45,6 +47,7 @@ def evaluate_split(
     limit: int = 50,
     dataset_path: str = "data/convfinqa_dataset.json",
     failure_limit: int = 10,
+    output_path: str | None = None,  # when set, writes summary+results to JSON for analysis
 ) -> EvalSummary:
     """
     Evaluate the solver on the first `limit` conversations in a split.
@@ -64,6 +67,7 @@ def evaluate_split(
     type2_total = type2_correct = 0
 
     failures: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
 
     for record in records:
         history: list[tuple[str, float]] = []
@@ -89,6 +93,20 @@ def evaluate_split(
             total_turns += 1
             if is_correct:
                 correct_turns += 1
+
+            results.append(
+                {
+                    "record_id": record.id,
+                    "turn": turn_idx,
+                    "question": q,
+                    "gold_raw": gold_raw,
+                    "gold": gold if comparable else None,
+                    "pred": pred,
+                    "reasoning": reasoning,
+                    "correct": is_correct,
+                    "has_type2": record.features.has_type2_question,
+                }
+            )
 
             if turn_idx <= 1:
                 t01_total += 1
@@ -128,7 +146,7 @@ def evaluate_split(
     acc_type1 = type1_correct / type1_total if type1_total else 0.0
     acc_type2 = type2_correct / type2_total if type2_total else 0.0
 
-    return EvalSummary(
+    summary = EvalSummary(
         split=split,
         limit=limit,
         total_records=len(records),
@@ -140,5 +158,30 @@ def evaluate_split(
         acc_type1=acc_type1,
         acc_type2=acc_type2,
         failures=failures,
+        results=results,
     )
+
+    if output_path:
+        # Keep the on-disk artifact self-contained: summary for quick reading,
+        # failures for error analysis, and results for deeper inspection.
+        payload = {
+            "summary": {
+                "split": summary.split,
+                "limit": summary.limit,
+                "total_records": summary.total_records,
+                "total_turns": summary.total_turns,
+                "correct_turns": summary.correct_turns,
+                "acc": summary.acc,
+                "acc_turn01": summary.acc_turn01,
+                "acc_turn2plus": summary.acc_turn2plus,
+                "acc_type1": summary.acc_type1,
+                "acc_type2": summary.acc_type2,
+            },
+            "failures": summary.failures,
+            "results": summary.results,
+        }
+        with open(output_path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    return summary
 

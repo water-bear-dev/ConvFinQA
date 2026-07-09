@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import requests
 from google import genai
@@ -27,6 +28,55 @@ from .schemas import SolverResponse
 logger = get_logger(__name__)
 
 _client: genai.Client | None = None
+
+
+_NUM_RE = re.compile(r"[-+]?(?:\\d+(?:,\\d{3})*|\\d+)(?:\\.\\d+)?")
+
+
+def _parse_numeric_answer(text: str) -> float | None:
+    """
+    Best-effort parse of a numeric answer from local-model strings.
+
+    Handles cases like:
+      - \"$4 million\" -> 4000000.0
+      - \"(1,234)\" -> -1234.0
+      - \"23.1\" -> 23.1
+      - sentences containing a number -> first number
+    """
+    s = text.strip()
+    if not s:
+        return None
+
+    # Parentheses sometimes indicate negatives in financial text.
+    negative = s.startswith("(") and s.endswith(")")
+    if negative:
+        s = s[1:-1].strip()
+
+    s_lower = s.lower()
+    multiplier = 1.0
+    if "billion" in s_lower:
+        multiplier = 1_000_000_000.0
+    elif "million" in s_lower:
+        multiplier = 1_000_000.0
+    elif "thousand" in s_lower:
+        multiplier = 1_000.0
+
+    # Strip currency/percent symbols and whitespace.
+    s_clean = s.replace("$", "").replace("%", "").strip()
+
+    m = _NUM_RE.search(s_clean)
+    if not m:
+        return None
+
+    num_str = m.group(0).replace(",", "")
+    try:
+        val = float(num_str) * multiplier
+    except Exception:  # noqa: BLE001
+        return None
+
+    if negative:
+        val = -val
+    return val
 
 
 def _get_client() -> genai.Client:
@@ -93,14 +143,15 @@ def _call_ollama(prompt: str) -> SolverResponse:
 
     # Normalize common local-model quirks so Pydantic validation is stable across models.
     if isinstance(obj, dict):
+        if "reasoning" not in obj:
+            obj["reasoning"] = None
+
         ans = obj.get("answer")
         if ans in ("null", "", "None"):
             obj["answer"] = None
         elif isinstance(ans, str):
-            try:
-                obj["answer"] = float(ans)
-            except Exception:
-                pass
+            parsed = _parse_numeric_answer(ans)
+            obj["answer"] = parsed if parsed is not None else ans
 
         expr = obj.get("expression")
         if expr in ("null", "", "None"):
@@ -162,5 +213,7 @@ def answer_turn(
             last_error = e
             logger.warning("Solver attempt %d failed: %s", attempt + 1, e)
 
-    raise RuntimeError(f"Solver failed after retries: {last_error}")
+    # Avoid crashing eval on schema drift / parse issues; return a sentinel numeric
+    # value and surface the error in the reasoning field.
+    return 0.0, f"ERROR: {last_error}"
 

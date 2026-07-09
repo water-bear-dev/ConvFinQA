@@ -15,6 +15,8 @@ I implemented a minimal, LLM-native prototype that answers one dialogue turn at 
   - **Local Ollama** (`OLLAMA_MODEL`, `OLLAMA_BASE_URL`) to avoid API quotas and keep data local, or
   - **Gemini** (`GOOGLE_API_KEY`, `GEMINI_MODEL`) as a hosted alternative.
 
+For the benchmark below, I used **Ollama** with `qwen2.5:7b-instruct` (see `.env`).
+
 ### Files added/updated
 
 - `src/models.py`: Pydantic dataset models (matches `dataset.md`).
@@ -24,7 +26,7 @@ I implemented a minimal, LLM-native prototype that answers one dialogue turn at 
 - `src/schemas.py`: `SolverResponse` for JSON structured output.
 - `src/calculator.py`: `safe_eval()` for simple arithmetic.
 - `src/solver.py`: LLM backend call (Ollama) + parse + optional expression evaluation.
-- `src/main.py`: CLI commands `show` and `chat` wired to the above.
+- `src/main.py`: CLI commands `show`, `chat`, and `eval` wired to the above.
 - `src/eval.py`: evaluation harness for turn-level execution accuracy + breakdowns.
 - `.env` (gitignored): local config for either Gemini or Ollama settings.
 
@@ -32,44 +34,99 @@ I implemented a minimal, LLM-native prototype that answers one dialogue turn at 
 
 - **Percentages**: the prompt instructs the model to return percentages as decimals (e.g. 14.1% → 0.141), aligning with `dialogue.executed_answers` formatting.
 - **Evaluation harness**: added in Block 2 (`src/eval.py`) to compute turn-level execution accuracy + breakdowns (turn index, Type I vs Type II).
- - **Conversational realism**: in evaluation, we append predicted answers to history even when wrong, so later turns reflect error compounding (matches real chat usage).
+- **Conversational realism**: in evaluation, we append predicted answers to history even when wrong, so later turns reflect error compounding (matches real chat usage).
+- **Local-model robustness (Ollama)**: local LLMs sometimes emit non-numeric / formatted answers (e.g. `"$4 million"` or sentences) or omit fields. To keep benchmarking stable:
+  - The prompt explicitly demands **JSON-only** output and **numeric-only** `answer`.
+  - The schema is more tolerant (accepts `answer` as `float | str | None`, `reasoning` optional).
+  - The solver normalizes common formats (currency symbols, commas, `million/billion/thousand`, parentheses negatives) into floats when possible.
+  - If parsing still fails after retries, the solver returns a sentinel numeric value (`0.0`) with an error string in reasoning so eval can continue.
 
 ## Error Analysis
 
-### Metrics (Block 2)
+### Metrics (full dev split)
 
 Run:
 
 ```bash
-uv run main eval --split dev --limit 50
+uv pip install . --reinstall
+uv run main eval --split dev --limit 421 --output eval_results.json
 ```
 
-Then copy/paste the printed summary here:
+**Turn-level execution accuracy (421 conversations, 1490 turns):**
 
-- **Turn-level Exe Acc (dev50)**: TBD
-- **Turn 0–1 Exe Acc**: TBD
-- **Turn 2+ Exe Acc**: TBD
-- **Type I Exe Acc**: TBD
-- **Type II Exe Acc**: TBD
+| Metric | Accuracy |
+|--------|----------|
+| **Overall** | **50.07%** (746/1490) |
+| Turn 0–1 | 58.08% |
+| Turn 2+ | 39.66% |
+| Type I (single table) | 54.18% |
+| Type II (multi-table / context switch) | 40.18% |
 
-Note: I did not run this benchmark inside chat because it requires using your API key. The key should stay only in your local `.env` (gitignored), not in commit history or terminal logs shared externally.
+**High-level takeaways:**
 
-### Failure modes to capture (after running dev50)
+- Early turns are easier: the model can often answer a direct lookup on turn 0–1, but accuracy drops ~18 points on turn 2+ as errors compound through conversation history.
+- Type II conversations are harder than Type I (~14 points), consistent with the need to track which table or metric the dialogue has switched to.
+- Among incorrect turns, the dominant failure modes are **percentage/ratio scaling** (~211 turns), **arithmetic / derived answers** (~200), and **initial lookup errors** (~161). Roughly **135** incorrect percentage turns look like a 100× scale error (model returns `-21.05` when gold is `-0.21053`). **47** turns returned the sentinel `0.0` after parse/eval failures.
 
-Pick 3–5 examples from the “Sample Failures” printed by `main eval`, and for each include:
+### Failure examples (from `eval_results.json`)
 
-- **Record / turn / question**
-- **Gold vs pred**
-- **Why it failed** (table row/column mismatch, coreference, percentage scaling, expression formatting, or context truncation)
-- **What fix to try** (prompt rule, post-processing rule, retry, etc.)
+#### 1. Lookup — wrong column on turn 0
 
-## Future Work 
+- **Record / turn**: `Single_MRO/2007/page_134.pdf-1`, turn 0
+- **Question**: “what was the weighted average exercise price per share in 2007?”
+- **Gold vs pred**: `60.94` vs `17.24`
+- **Why it failed**: the table contains multiple “weighted average …” columns (exercise price vs grant-date fair value). The model read the wrong column on the first turn, poisoning all downstream math.
+- **Fix to try**: prompt the model to quote the exact row + column header before answering; optionally add a lightweight column-disambiguation step for tables with similar headers.
 
-- Expand eval beyond dev50 and add richer breakdowns (by turn position distribution, numeric vs non-numeric tables, duplicate columns, etc.).
-- Improve robustness of the solver (retry logic, better coreference handling, stricter expression formatting).
-- Add lightweight error analysis tooling (store a small set of failures for inspection).
+#### 2. Coreference — follow-up year lookup drift
 
-## [may not apply] If & how you've used coding assistants or gen AI tools to help with this assignment 
+- **Record / turn**: `Single_MRO/2007/page_134.pdf-1`, turn 1
+- **Question**: “and what was it in 2005?”
+- **Gold vs pred**: `25.14` vs `6.15`
+- **Why it failed**: even with prior context, the model did not reliably map “it” back to the same column for a different year row.
+- **Fix to try**: require the model to restate the metric from turn 0 in follow-up turns; include explicit row/column labels in conversation history.
+
+#### 3. Math — compounding from wrong prior answers
+
+- **Record / turn**: `Single_MRO/2007/page_134.pdf-1`, turn 2
+- **Question**: “what was, then, the change over the years?”
+- **Gold vs pred**: `35.8` vs `11.09`
+- **Why it failed**: the model subtracted its own incorrect 2007/2005 values (`17.24 − 6.15`) rather than the gold operands. Eval appends predicted answers to history, so early lookup errors cascade.
+- **Fix to try**: prefer `expression` fields that reference prior turn indices; add validation that operands match history before `safe_eval`.
+
+#### 4. Percentage — 100× scale error
+
+- **Record / turn**: `Double_HII/2017/page_104.pdf`, turn 1
+- **Question**: “so what was the percentage change during this time?”
+- **Gold vs pred**: `-0.21053` vs `-21.05`
+- **Why it failed**: arithmetic was correct (`−4/19`), but the model multiplied by 100 and returned a percentage value instead of the dataset’s decimal convention. Reasoning explicitly shows `* 100`.
+- **Fix to try**: strengthen the decimal-percentage rule in the prompt; add a post-check that flags answers ~100× off gold magnitude on percentage questions.
+
+#### 5. Type II — context switch to wrong metric
+
+- **Record / turn**: `Double_HII/2017/page_104.pdf`, turn 2
+- **Question**: “what was the change associated with credit facilities during that time?”
+- **Gold vs pred**: `3.0` vs `1.0`
+- **Why it failed**: after answering about senior-note issuance costs, the dialogue switched to credit facilities. The model instead differenced total long-term debt (`1279 − 1278`), reading the wrong row entirely.
+- **Fix to try**: prompt the model to identify which table section and line item each turn refers to; track “active metric” explicitly across Type II switches.
+
+#### 6. Sentinel fallback — wrong prior value locks in zero
+
+- **Record / turn**: `Single_UNP/2008/page_77.pdf-2`, turn 2
+- **Question**: “so what was the difference between the two years?”
+- **Gold vs pred**: `-10.0` vs `0.0`
+- **Why it failed**: turn 1 incorrectly returned `93.0` for 2007 (gold `103.0`). On turn 2 the model concluded both years were `93.0` and answered `0.0` — a compounding lookup error rather than a parse failure.
+- **Fix to try**: on large discrepancies between re-asked values and history, re-fetch from the document instead of trusting prior turns.
+
+## Future Work
+
+- **Stronger local model or hosted API**: `qwen2.5:7b-instruct` is a meaningful step up from smaller models, but 50% turn accuracy suggests room for a larger instruct model or Gemini with quota headroom.
+- **Expression normalization**: preprocess model expressions before `safe_eval` (strip `=`, `$`, commas, unsupported functions like `min()` / `sum()`).
+- **Percentage post-check**: detect and auto-correct 100× scale errors when the question asks for a percentage or ratio.
+- **Column disambiguation**: lightweight header-matching or “cite your cell” prompting for tables with near-duplicate column names.
+- **Richer eval breakdowns**: failure counts by turn position, error type tags, and per-record accuracy distributions.
+
+## [may not apply] If & how you've used coding assistants or gen AI tools to help with this assignment
 Please be honest.
 
 Used Cursor as an AI-assisted IDE for implementation planning and code generation/refactoring. All code was reviewed and adapted to match the dataset schema and the structured-output approach.
