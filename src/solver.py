@@ -1,17 +1,19 @@
 """
-LLM-driven solver for ConvFinQA turns using Gemini Flash.
+LLM-driven solver for ConvFinQA turns.
 
 The solver:
   - Formats the document into markdown
-  - Sends document + prior turn history + current question to Gemini
+  - Sends document + prior turn history + current question to an LLM backend
   - Receives structured JSON (SolverResponse)
   - Optionally evaluates arithmetic deterministically via safe_eval()
 """
 
 from __future__ import annotations
 
+import json
 import os
 
+import requests
 from google import genai
 from google.genai import types
 
@@ -63,6 +65,62 @@ def _call_gemini(prompt: str) -> SolverResponse:
     return SolverResponse.model_validate_json(response.text)
 
 
+def _call_ollama(prompt: str) -> SolverResponse:
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "gemma4:latest")
+
+    url = f"{base_url}/api/chat"
+    # `format="json"` requests a JSON-only completion. Some local models still return
+    # JSON values with stringified nulls/numbers, so we normalize before validation.
+    payload = {
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    }
+
+    resp = requests.post(url, json=payload, timeout=120)
+    resp.raise_for_status()
+    raw = resp.json()
+    content = raw.get("message", {}).get("content", "")
+    try:
+        obj = json.loads(content)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"Ollama returned invalid JSON: {e}") from e
+
+    # Normalize common local-model quirks so Pydantic validation is stable across models.
+    if isinstance(obj, dict):
+        ans = obj.get("answer")
+        if ans in ("null", "", "None"):
+            obj["answer"] = None
+        elif isinstance(ans, str):
+            try:
+                obj["answer"] = float(ans)
+            except Exception:
+                pass
+
+        expr = obj.get("expression")
+        if expr in ("null", "", "None"):
+            obj["expression"] = None
+
+        ip = obj.get("is_percentage")
+        if isinstance(ip, str):
+            obj["is_percentage"] = ip.strip().lower() in {"true", "1", "yes"}
+
+    return SolverResponse.model_validate(obj)
+
+
+def _choose_backend() -> str:
+    # Prefer Ollama if configured (local, no API key / quota dependency),
+    # otherwise fall back to Gemini.
+    if os.getenv("OLLAMA_MODEL") or os.getenv("OLLAMA_BASE_URL"):
+        return "ollama"
+    return "gemini"
+
+
 def answer_turn(
     record: ConvFinQARecord,
     history: list[tuple[str, float]],
@@ -72,15 +130,20 @@ def answer_turn(
     doc_text = format_document(record.doc)
     prompt = build_user_prompt(doc_text, history, question)
 
+    backend = _choose_backend()
+
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            parsed = _call_gemini(prompt)
+            if backend == "ollama":
+                parsed = _call_ollama(prompt)
+            else:
+                parsed = _call_gemini(prompt)
 
             numeric_answer: float | None = None
             if parsed.expression:
                 try:
-                    # Prefer deterministic arithmetic to avoid model math mistakes.
+                    # Prefer deterministic arithmetic to avoid model math mistakes and keep eval repeatable.
                     numeric_answer = safe_eval(parsed.expression)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("safe_eval failed: %s", e)

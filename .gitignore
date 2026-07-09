@@ -16,6 +16,6 @@ __pycache__/
 
 .*cache
 
-
+eval_results.json
 
 uv.lock

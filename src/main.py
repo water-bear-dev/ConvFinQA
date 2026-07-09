@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from rich import print as rich_print
 
 from .data import DatasetLoader
+from .eval import evaluate_split
 from .format import format_document
 from .solver import answer_turn
 
@@ -73,6 +74,38 @@ def chat(
             f"[blue][bold]assistant:[/bold] {answer} "
             f"(Reasoning: {reasoning})[/blue]"
         )
+
+
+@app.command()
+def eval(
+    split: str = typer.Option("dev", help="Dataset split to evaluate"),
+    limit: int = typer.Option(50, help="Max number of conversations to evaluate"),
+) -> None:
+    """Replay scripted conversations and report execution accuracy."""
+    summary = evaluate_split(split=split, limit=limit)
+
+    rich_print("[bold blue]Evaluation Summary[/bold blue]")
+    rich_print(
+        f"Split={summary.split}  Records={summary.total_records}  "
+        f"Turns={summary.total_turns}  Correct={summary.correct_turns}"
+    )
+    rich_print(f"[bold]Turn-level Exe Acc:[/bold] {summary.acc:.2%}")
+    rich_print(
+        f"[bold]Turn 0–1:[/bold] {summary.acc_turn01:.2%}    "
+        f"[bold]Turn 2+:[/bold] {summary.acc_turn2plus:.2%}"
+    )
+    rich_print(
+        f"[bold]Type I:[/bold] {summary.acc_type1:.2%}    "
+        f"[bold]Type II:[/bold] {summary.acc_type2:.2%}"
+    )
+
+    if summary.failures:
+        rich_print("\n[bold blue]Sample Failures (first few)[/bold blue]")
+        for f in summary.failures[:5]:
+            rich_print(
+                f"- {f['record_id']} (turn {f['turn']}, type2={f['has_type2']}): "
+                f"gold={f['gold_raw']} pred={f['pred']}"
+            )
 
 
 if __name__ == "__main__":
