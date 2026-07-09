@@ -47,6 +47,31 @@ How to *chat*:
 ```bash
 uv run main chat <record_id> 
 ```
+
+### Evaluate
+
+```bash
+uv pip install . --reinstall
+uv run main eval --split dev --limit 50 --output eval_results.json
+uv run main eval --split dev --limit 421 --output eval_results_v2.json --baseline eval_results_baseline.json
+uv run main eval-compare eval_results_baseline.json eval_results_v2.json
+```
+
+### Configuration
+
+Copy `.env.example` to `.env` and set:
+
+- **Ollama (local)**: `OLLAMA_BASE_URL`, `OLLAMA_MODEL` (default `qwen2.5:7b-instruct`; try `qwen2.5:14b-instruct` for higher accuracy)
+- **Gemini (hosted)**: `GOOGLE_API_KEY`, `GEMINI_MODEL` — used when Ollama is not configured
+- **Routing**: `SOLVER_ROUTER=auto|single|two_step` (default `auto`)
+
+### Tests
+
+```bash
+uv sync --extra dev
+uv run pytest
+```
+
 [![Chat](figures/chat_example.png)](figures/chat.png)  
 
 ## Submission 

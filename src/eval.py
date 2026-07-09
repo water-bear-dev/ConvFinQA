@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .data import DatasetLoader
+from .history import TurnState
 from .solver import answer_turn
 
 
@@ -26,6 +27,36 @@ def answers_match(pred: float, gold: float, tol: float = 1e-2) -> bool:
     return abs(pred - gold) / max(abs(gold), 1) < tol
 
 
+def infer_error_tag(
+    turn_idx: int,
+    question: str,
+    has_type2: bool,
+    correct: bool,
+    reasoning: str | None,
+) -> str | None:
+    """Heuristic error category for incorrect turns."""
+    if correct:
+        return None
+    if reasoning and reasoning.startswith("ERROR:"):
+        return "parse"
+
+    q = question.lower()
+    if turn_idx == 0:
+        return "lookup"
+    if has_type2 and turn_idx >= 2:
+        return "type2"
+    if any(w in q for w in ("percent", "percentage", "ratio", "relation", "proportion")):
+        return "percentage"
+    if any(
+        w in q
+        for w in ("difference", "change", "increase", "decrease", "subtract", "sum", "total")
+    ):
+        return "math"
+    if any(w in q for w in ("what about", "and what", "that", "it in", "and in")):
+        return "coreference"
+    return "other"
+
+
 @dataclass(frozen=True)
 class EvalSummary:
     split: str
@@ -38,8 +69,11 @@ class EvalSummary:
     acc_turn2plus: float
     acc_type1: float
     acc_type2: float
-    failures: list[dict[str, Any]]  # small sample of incorrect turns (for report/examples)
-    results: list[dict[str, Any]]  # full per-turn trace (one row per dialogue turn)
+    acc_by_route: dict[str, float]
+    retry_count: int
+    error_tag_counts: dict[str, int]
+    failures: list[dict[str, Any]]
+    results: list[dict[str, Any]]
 
 
 def evaluate_split(
@@ -47,7 +81,7 @@ def evaluate_split(
     limit: int = 50,
     dataset_path: str = "data/convfinqa_dataset.json",
     failure_limit: int = 10,
-    output_path: str | None = None,  # when set, writes summary+results to JSON for analysis
+    output_path: str | None = None,
 ) -> EvalSummary:
     """
     Evaluate the solver on the first `limit` conversations in a split.
@@ -60,26 +94,35 @@ def evaluate_split(
     total_turns = 0
     correct_turns = 0
 
-    # Breakdowns
     t01_total = t01_correct = 0
     t2p_total = t2p_correct = 0
     type1_total = type1_correct = 0
     type2_total = type2_correct = 0
 
+    route_totals: dict[str, int] = {}
+    route_correct: dict[str, int] = {}
+    retry_count = 0
+    error_tag_counts: dict[str, int] = {}
+
     failures: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
 
     for record in records:
-        history: list[tuple[str, float]] = []
+        history: list[TurnState] = []
 
         for turn_idx, (q, gold_raw) in enumerate(
             zip(record.dialogue.conv_questions, record.dialogue.executed_answers)
         ):
-            pred, reasoning = answer_turn(record, history, q)
-            # Important: we append predictions even when wrong. This mirrors real chat
-            # usage where mistakes compound across turns, and matches ConvFinQA's
-            # conversational evaluation setting.
-            history.append((q, pred))
+            result = answer_turn(record, history, q, turn_idx=turn_idx)
+            pred = result.answer
+            reasoning = result.reasoning
+
+            history.append(
+                TurnState(question=q, answer=pred, metric=result.metric)
+            )
+
+            if result.retried:
+                retry_count += 1
 
             try:
                 gold = float(gold_raw)
@@ -89,24 +132,36 @@ def evaluate_split(
                 comparable = False
 
             is_correct = comparable and answers_match(pred, gold)
+            error_tag = infer_error_tag(
+                turn_idx, q, record.features.has_type2_question, is_correct, reasoning
+            )
 
             total_turns += 1
             if is_correct:
                 correct_turns += 1
 
-            results.append(
-                {
-                    "record_id": record.id,
-                    "turn": turn_idx,
-                    "question": q,
-                    "gold_raw": gold_raw,
-                    "gold": gold if comparable else None,
-                    "pred": pred,
-                    "reasoning": reasoning,
-                    "correct": is_correct,
-                    "has_type2": record.features.has_type2_question,
-                }
-            )
+            route_totals[result.route] = route_totals.get(result.route, 0) + 1
+            if is_correct:
+                route_correct[result.route] = route_correct.get(result.route, 0) + 1
+
+            if error_tag:
+                error_tag_counts[error_tag] = error_tag_counts.get(error_tag, 0) + 1
+
+            row = {
+                "record_id": record.id,
+                "turn": turn_idx,
+                "question": q,
+                "gold_raw": gold_raw,
+                "gold": gold if comparable else None,
+                "pred": pred,
+                "reasoning": reasoning,
+                "correct": is_correct,
+                "has_type2": record.features.has_type2_question,
+                "route": result.route,
+                "retried": result.retried,
+                "error_tag": error_tag,
+            }
+            results.append(row)
 
             if turn_idx <= 1:
                 t01_total += 1
@@ -137,6 +192,8 @@ def evaluate_split(
                         "reasoning": reasoning,
                         "has_type2": record.features.has_type2_question,
                         "gold_castable": comparable,
+                        "route": result.route,
+                        "error_tag": error_tag,
                     }
                 )
 
@@ -145,6 +202,10 @@ def evaluate_split(
     acc_turn2plus = t2p_correct / t2p_total if t2p_total else 0.0
     acc_type1 = type1_correct / type1_total if type1_total else 0.0
     acc_type2 = type2_correct / type2_total if type2_total else 0.0
+    acc_by_route = {
+        route: route_correct.get(route, 0) / total
+        for route, total in route_totals.items()
+    }
 
     summary = EvalSummary(
         split=split,
@@ -157,13 +218,14 @@ def evaluate_split(
         acc_turn2plus=acc_turn2plus,
         acc_type1=acc_type1,
         acc_type2=acc_type2,
+        acc_by_route=acc_by_route,
+        retry_count=retry_count,
+        error_tag_counts=error_tag_counts,
         failures=failures,
         results=results,
     )
 
     if output_path:
-        # Keep the on-disk artifact self-contained: summary for quick reading,
-        # failures for error analysis, and results for deeper inspection.
         payload = {
             "summary": {
                 "split": summary.split,
@@ -176,6 +238,9 @@ def evaluate_split(
                 "acc_turn2plus": summary.acc_turn2plus,
                 "acc_type1": summary.acc_type1,
                 "acc_type2": summary.acc_type2,
+                "acc_by_route": summary.acc_by_route,
+                "retry_count": summary.retry_count,
+                "error_tag_counts": summary.error_tag_counts,
             },
             "failures": summary.failures,
             "results": summary.results,
@@ -185,3 +250,54 @@ def evaluate_split(
 
     return summary
 
+
+def compare_eval_results(
+    baseline_path: str, candidate_path: str
+) -> dict[str, Any]:
+    """Compare two eval JSON artifacts and return deltas."""
+    with open(baseline_path) as f:
+        baseline = json.load(f)
+    with open(candidate_path) as f:
+        candidate = json.load(f)
+
+    b_sum = baseline["summary"]
+    c_sum = candidate["summary"]
+
+    b_rows = {
+        (r["record_id"], r["turn"]): r for r in baseline.get("results", [])
+    }
+    c_rows = {
+        (r["record_id"], r["turn"]): r for r in candidate.get("results", [])
+    }
+
+    fixed: list[dict[str, Any]] = []
+    broken: list[dict[str, Any]] = []
+    for key, brow in b_rows.items():
+        crow = c_rows.get(key)
+        if not crow:
+            continue
+        if not brow.get("correct") and crow.get("correct"):
+            fixed.append(crow)
+        elif brow.get("correct") and not crow.get("correct"):
+            broken.append(crow)
+
+    metrics = [
+        "acc",
+        "acc_turn01",
+        "acc_turn2plus",
+        "acc_type1",
+        "acc_type2",
+    ]
+    deltas = {
+        m: c_sum.get(m, 0) - b_sum.get(m, 0) for m in metrics
+    }
+
+    return {
+        "baseline": b_sum,
+        "candidate": c_sum,
+        "deltas": deltas,
+        "fixed_count": len(fixed),
+        "broken_count": len(broken),
+        "fixed_sample": fixed[:10],
+        "broken_sample": broken[:10],
+    }

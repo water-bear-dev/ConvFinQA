@@ -17,7 +17,35 @@ I implemented a minimal, LLM-native prototype that answers one dialogue turn at 
 
 For the benchmark below, I used **Ollama** with `qwen2.5:7b-instruct` (see `.env`).
 
-### Files added/updated
+### Accuracy improvements (post-baseline)
+
+After the initial 50.07% benchmark, I implemented a multi-phase accuracy pass:
+
+- **Foundation fixes**: corrected numeric regex parsing, Ollama `temperature=0`, expression normalization before `safe_eval`.
+- **Post-processing**: `src/postprocess.py` auto-corrects 100× percentage scale errors (e.g. `-21.05` → `-0.2105`).
+- **Auto-routed two-step solver**: `src/router.py` sends turn-0 lookups and re-asks through retrieve-then-compute (`RetrievalResponse` → `SolverResponse`); math follow-ups stay on the faster single-call path.
+- **Consistency checks**: on re-ask turns, retrieved cell values that disagree with history trigger a correction note and optional retry.
+- **Richer eval**: per-turn `route`, `error_tag`, `retried` fields; `main eval-compare` for before/after deltas.
+
+Re-benchmark with:
+
+```bash
+cp eval_results.json eval_results_baseline.json   # if not already saved
+uv run main eval --split dev --limit 421 --output eval_results_v2.json --baseline eval_results_baseline.json
+uv run main eval-compare eval_results_baseline.json eval_results_v2.json
+```
+
+### Files added/updated (accuracy pass)
+
+- `src/postprocess.py`: percentage scale correction.
+- `src/router.py`: auto routing (`SOLVER_ROUTER=auto|single|two_step`).
+- `src/history.py`: `TurnState` with optional active metric for Type II.
+- `src/prompts.py`: hardened prompts + retrieve/compute prompt builders.
+- `src/schemas.py`: `CellRetrieval`, `RetrievalResponse`, optional `source` on `SolverResponse`.
+- `tests/test_calculator.py`: unit tests for calculator, postprocess, router.
+- `.env.example`: documented model and routing options.
+
+### Files added/updated (initial)
 
 - `src/models.py`: Pydantic dataset models (matches `dataset.md`).
 - `src/data.py`: dataset loader + O(1) record lookup by id.
@@ -120,11 +148,10 @@ uv run main eval --split dev --limit 421 --output eval_results.json
 
 ## Future Work
 
-- **Stronger local model or hosted API**: `qwen2.5:7b-instruct` is a meaningful step up from smaller models, but 50% turn accuracy suggests room for a larger instruct model or Gemini with quota headroom.
-- **Expression normalization**: preprocess model expressions before `safe_eval` (strip `=`, `$`, commas, unsupported functions like `min()` / `sum()`).
-- **Percentage post-check**: detect and auto-correct 100× scale errors when the question asks for a percentage or ratio.
-- **Column disambiguation**: lightweight header-matching or “cite your cell” prompting for tables with near-duplicate column names.
-- **Richer eval breakdowns**: failure counts by turn position, error type tags, and per-record accuracy distributions.
+- **Re-run full dev421 benchmark** with the improved solver and record v1 vs v2 metrics in this report.
+- **Stronger local model or hosted API**: try `qwen2.5:14b-instruct` or Gemini if accuracy plateaus.
+- **Finer-grained routing**: distinguish ratio questions that need two-step compute vs single-call.
+- **Per-record error dashboards**: use `error_tag_counts` from eval JSON for targeted prompt tuning.
 
 ## [may not apply] If & how you've used coding assistants or gen AI tools to help with this assignment
 Please be honest.

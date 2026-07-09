@@ -9,9 +9,22 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class CellRetrieval(BaseModel):
+    row_label: str = Field(description="Exact table row label used.")
+    column_header: str = Field(description="Exact table column header used.")
+    value: float = Field(description="Numeric cell value.")
+    metric: str = Field(description="Human-readable description of the metric.")
+
+
+class RetrievalResponse(BaseModel):
+    cells: list[CellRetrieval] = Field(default_factory=list)
+    active_metric: str | None = Field(
+        default=None, description="Current metric thread for Type II dialogues."
+    )
+    reasoning: str | None = Field(default=None)
+
+
 class SolverResponse(BaseModel):
-    # Local models occasionally omit fields; we keep this optional to avoid hard failures
-    # and rely on downstream code to treat missing reasoning as low-confidence output.
     reasoning: str | None = Field(
         default=None, description="Brief explanation grounded in the document."
     )
@@ -19,8 +32,6 @@ class SolverResponse(BaseModel):
         default=None,
         description='Optional arithmetic expression, e.g. "206588 - 181001".',
     )
-    # Accept either a number or a string; local models often emit formatted answers
-    # (e.g. \"$4 million\"). The solver normalizes these to floats when possible.
     answer: float | str | None = Field(
         default=None,
         description="Fallback numeric answer if no expression is provided.",
@@ -29,4 +40,7 @@ class SolverResponse(BaseModel):
         default=False,
         description="True if the answer is a percentage (returned as a decimal).",
     )
-
+    source: str | None = Field(
+        default=None,
+        description='Optional cell citation, e.g. "row: 2007, column: revenue".',
+    )
