@@ -198,3 +198,11 @@ uv run main eval --split dev --limit 421 --output eval_results.json
 7. **Error-driven prompt tuning**: use `error_tag_counts` from eval JSON to target the worst categories (percentage, lookup) with few-shot examples.
 
 ## AI tool disclosure
+
+I used **Cursor** as an AI-assisted IDE throughout this assignment. Specifically:
+
+- **Planning and architecture**: discussed approach trade-offs (LLM-native vs program synthesis, eval design, accuracy improvement phases).
+- **Code generation and refactoring**: scaffolded modules (`solver.py`, `eval.py`, `router.py`, `postprocess.py`, tests) and iterated on bug fixes (e.g. numeric regex, percentage post-processing).
+- **Report drafting**: initial structure and error-analysis write-up were drafted with assistance, then reviewed and edited manually.
+
+All generated code and report text were reviewed, tested (unit tests + eval runs), and adapted to match the dataset schema and assignment requirements. Final decisions on method, metrics, and limitations are my own.
