@@ -1,9 +1,24 @@
 # ConvFinQA Report
 
-*The headers here are guidelines, you can structure your report however you like.*
 ## Method
 
-### Current implementation (Blocks 1–2: core solver + eval harness)
+### Why this approach
+
+ConvFinQA is a **multi-turn, table-grounded numerical QA** task: each turn may require (1) reading the right cell from a financial table, (2) resolving coreference to prior turns, and (3) doing arithmetic. I chose an **LLM-native, turn-by-turn solver** rather than training a bespoke model or hard-coding a FinQA DSL interpreter for three reasons:
+
+1. **Time and data**: the assignment is a prototype on ~3.5k cleaned records. A general-purpose LLM with the full document in context is the fastest path to a working conversational system without finetuning.
+2. **Conversational structure**: turns build on prior answers (“what about 2005?”, “what is the difference?”). Maintaining explicit `(question, answer)` history and feeding it back each turn mirrors how a chat product would behave.
+3. **Separation of reading vs math**: the model is strong at language understanding but weak at reliable arithmetic and percentage scaling. I therefore combine **structured JSON output** (what to compute) with **`safe_eval`** (deterministic execution) so math is not left entirely to the LLM.
+
+**Alternatives considered and not pursued:**
+
+- **End-to-end program synthesis** (predict `turn_program` directly): more faithful to the original FinQA paper, but heavier to build and debug in a short assignment window.
+- **Retrieval-only / no LLM**: insufficient for coreference and multi-step reasoning over dialogue.
+- **Single-shot “answer all turns at once”**: harder to evaluate turn-by-turn and unrealistic for an interactive chat CLI.
+
+**Backend choice:** I used **Ollama + `qwen2.5:7b-instruct`** locally to avoid API quota limits and keep iteration fast. The same code path supports **Gemini** as a hosted fallback when `GOOGLE_API_KEY` is set.
+
+### Current implementation
 
 I implemented a minimal, LLM-native prototype that answers one dialogue turn at a time using:
 
@@ -17,9 +32,9 @@ I implemented a minimal, LLM-native prototype that answers one dialogue turn at 
 
 For the benchmark below, I used **Ollama** with `qwen2.5:7b-instruct` (see `.env`).
 
-### Accuracy improvements (post-baseline)
+### Accuracy improvements (post-baseline, not fully re-benchmarked)
 
-After the initial 50.07% benchmark, I implemented a multi-phase accuracy pass:
+After the initial 50.07% benchmark, I implemented a multi-phase accuracy pass. A full dev421 re-run was started but **aborted partway through** (~4.5 hours) due to runtime; the two-step router roughly doubles LLM calls on lookup turns. The improvements below are implemented in code but **not reflected in the headline metrics** in this report, which remain from the baseline run.
 
 - **Foundation fixes**: corrected numeric regex parsing, Ollama `temperature=0`, expression normalization before `safe_eval`.
 - **Post-processing**: `src/postprocess.py` auto-corrects 100× percentage scale errors (e.g. `-21.05` → `-0.2105`).
@@ -146,14 +161,40 @@ uv run main eval --split dev --limit 421 --output eval_results.json
 - **Why it failed**: turn 1 incorrectly returned `93.0` for 2007 (gold `103.0`). On turn 2 the model concluded both years were `93.0` and answered `0.0` — a compounding lookup error rather than a parse failure.
 - **Fix to try**: on large discrepancies between re-asked values and history, re-fetch from the document instead of trusting prior turns.
 
-## Future Work
+## Strengths and limitations
 
-- **Re-run full dev421 benchmark** with the improved solver and record v1 vs v2 metrics in this report.
-- **Stronger local model or hosted API**: try `qwen2.5:14b-instruct` or Gemini if accuracy plateaus.
-- **Finer-grained routing**: distinguish ratio questions that need two-step compute vs single-call.
-- **Per-record error dashboards**: use `error_tag_counts` from eval JSON for targeted prompt tuning.
+### Strengths
 
-## [may not apply] If & how you've used coding assistants or gen AI tools to help with this assignment
-Please be honest.
+- **End-to-end prototype**: load dataset → format document → multi-turn chat → turn-level eval with breakdowns (turn index, Type I/II).
+- **Structured output + safe arithmetic**: JSON schema constrains the model; `safe_eval` handles `+ − × /` without arbitrary code execution.
+- **Conversational eval fidelity**: predicted (including wrong) answers are appended to history, so metrics reflect real error compounding.
+- **Backend flexibility**: Ollama for local iteration, Gemini as an alternative; routing and post-processing are modular.
+- **Actionable error analysis**: failure examples map cleanly to fix categories (lookup, coreference, percentage scale, Type II context switch).
 
-Used Cursor as an AI-assisted IDE for implementation planning and code generation/refactoring. All code was reviewed and adapted to match the dataset schema and the structured-output approach.
+### Limitations (honest assessment)
+
+- **50% turn accuracy is modest**: on a local 7B model, half of all turns are wrong. This is not production-ready without stronger models or more engineering.
+- **Turn-0 lookup is the bottleneck**: ~161 conversations start with a wrong first answer; ~51% of later errors cascade from that. Column disambiguation in tables with similar headers remains hard.
+- **Percentage convention drift**: despite prompt rules, the model often returns whole-number percentages (`-21.05`) instead of decimals (`-0.21053`). Post-processing helps but is heuristic.
+- **Local model fragility**: Ollama sometimes returns invalid JSON, empty cell values in retrieval, or expressions with unsupported syntax (`min()`, variable names). These fall back to `0.0` sentinel answers, which hurts accuracy silently.
+- **Two-step solver trade-off**: retrieve-then-compute is conceptually right but slower and introduces new failure modes (retrieval validation errors observed in logs). Not fully validated at scale.
+- **No gold programs at runtime**: `turn_program` in the dataset is useful for analysis but unused; a hybrid LLM+program approach might be more accurate.
+- **Incomplete v2 benchmark**: improvements were implemented after the baseline run; a fair before/after comparison on dev421 was not completed.
+
+## Future work (if I had more time)
+
+**Already implemented but not re-benchmarked:**
+
+- Expression normalization, percentage `/100` post-check, auto-routed two-step solver, consistency retry on history mismatch, richer eval tags and `eval-compare`.
+
+**What I would do next:**
+
+1. **Finish a fair comparison**: run `--limit 50` (or full dev421 overnight) with `SOLVER_ROUTER=auto` vs `single` and report deltas using `eval-compare`.
+2. **Stronger model**: try `qwen2.5:14b-instruct` or Gemini 2.0 Flash with native JSON schema — likely the highest ROI for table grounding.
+3. **Robust retrieval parsing**: tolerate empty/non-numeric cell values in `RetrievalResponse`; skip bad cells and retry retrieval instead of failing the turn.
+4. **Hybrid program synthesis**: use the LLM to emit a constrained DSL step per turn (lookup / subtract / divide) and execute deterministically — closer to the original ConvFinQA approach.
+5. **Column disambiguation**: when multiple headers match a question, score columns by string similarity to the question and prior `active_metric`.
+6. **Self-correction without gold**: on re-ask turns, always re-fetch from the table and prefer document values over history when they disagree by >5%.
+7. **Error-driven prompt tuning**: use `error_tag_counts` from eval JSON to target the worst categories (percentage, lookup) with few-shot examples.
+
+## AI tool disclosure
